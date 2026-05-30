@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+    <resources>
+        <!-- 使用 AppCompat 主题，兼容性最好 -->
+        <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
+            <item name="colorPrimary">#E94560</item>
+            <item name="colorPrimaryDark">#1A1A2E</item>
+            <item name="colorAccent">#0F3460</item>
+        </style>
+    </resources>
+    

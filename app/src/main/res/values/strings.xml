@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WebDecrypt Pro</string>
+    <string name="xposed_description">通用Web本地加密HTML解密模块 — 系统层级拦截获取源码</string>
+</resources>
