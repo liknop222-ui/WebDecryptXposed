@@ -24,7 +24,7 @@
         <!-- Xposed模块描述 -->
         <meta-data
             android:name="xposeddescription"
-            android:value="通用Web本地加密HTML解密模块 — 系统层级拦截获取源码" />
+            android:value="通用Web本地加密HTML解密模块 — 系统层级拦截 + JS注入 + HTML捕捉 + 交互优化" />
 
         <!-- Xposed最低版本 (API 82 = Xposed Framework 82+) -->
         <meta-data
@@ -47,11 +47,7 @@
             </intent-filter>
         </activity>
 
-        <!-- Xposed Hook服务 (LSPosed兼容) -->
-        <service
-            android:name=".WebDecryptHook"
-            android:enabled="true"
-            android:exported="false" />
+
 
     </application>
 
