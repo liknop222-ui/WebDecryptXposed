@@ -3,15 +3,18 @@ package com.webdecrypt.xposed;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Bundle;
-import android.text.method.ScrollingMovementMethod;
+import android.os.Handler;
+import android.os.Looper;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -25,8 +28,9 @@ import android.widget.TextView;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.Map;
 
 public class MainActivity extends Activity {
 
@@ -39,20 +43,34 @@ public class MainActivity extends Activity {
     private static final String KEY_ANTI_DETECTION = "anti_detection";
     private static final String OUTPUT_DIR = "/sdcard/WebDecrypt/";
 
+    // 精美配色
+    private static final String C_BG = "#0B0B18";
+    private static final String C_CARD = "#15152E";
+    private static final String C_CARD_INNER = "#101024";
+    private static final String C_ACCENT = "#E94560";
+    private static final String C_ACCENT2 = "#7B2FF7";
+    private static final String C_TEXT = "#E8E8F0";
+    private static final String C_TEXT_DIM = "#8A8AB0";
+    private static final String C_OK = "#5BD8A0";
+    private static final String C_WARN = "#FFB454";
+    private static final String C_ERR = "#FF6B6B";
+
     private SharedPreferences prefs;
     private LinearLayout rootLayout;
     private TextView statusText;
+    private Handler handler;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE);
+        handler = new Handler(Looper.getMainLooper());
 
         ScrollView scrollView = new ScrollView(this);
+        scrollView.setBackgroundColor(Color.parseColor(C_BG));
         rootLayout = new LinearLayout(this);
         rootLayout.setOrientation(LinearLayout.VERTICAL);
-        rootLayout.setPadding(40, 40, 40, 40);
-        rootLayout.setBackgroundColor(Color.parseColor("#0F0F1A"));
+        rootLayout.setPadding(dp(18), dp(18), dp(18), dp(28));
 
         buildHeader();
         buildLspStatusSection();
@@ -60,6 +78,7 @@ public class MainActivity extends Activity {
         buildQuickActions();
         buildCaptureSettings();
         buildJsInjectionSection();
+        buildDecryptSection();
         buildBuiltInScriptsSection();
         buildHtmlCaptureSection();
         buildWebDebugSection();
@@ -71,45 +90,149 @@ public class MainActivity extends Activity {
         setContentView(scrollView);
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // UI 构建工具（卡片式精美布局）
+    // ════════════════════════════════════════════════════════════════
+
+    private int dp(float v) {
+        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
+    }
+
+    /** 创建一张圆角卡片容器 */
+    private LinearLayout createCard() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(16));
+        bg.setColor(Color.parseColor(C_CARD));
+        card.setBackground(bg);
+        card.setPadding(dp(18), dp(16), dp(18), dp(16));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(14));
+        card.setLayoutParams(lp);
+        return card;
+    }
+
+    /** 卡片渐变标题栏 */
+    private TextView createCardTitle(String title) {
+        TextView tv = new TextView(this);
+        tv.setText(title);
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        tv.setTypeface(null, Typeface.BOLD);
+        tv.setPadding(dp(14), dp(10), dp(14), dp(10));
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+            new int[]{Color.parseColor(C_ACCENT), Color.parseColor(C_ACCENT2)});
+        bg.setCornerRadius(dp(12));
+        tv.setBackground(bg);
+        return tv;
+    }
+
+    private TextView createDesc(String text) {
+        TextView tv = new TextView(this);
+        tv.setText(text);
+        tv.setTextColor(Color.parseColor(C_TEXT_DIM));
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        tv.setLineSpacing(dp(2), 1f);
+        tv.setPadding(0, dp(10), 0, dp(6));
+        return tv;
+    }
+
+    private Button createButton(String text, String bgColor) {
+        Button btn = new Button(this);
+        btn.setText(text);
+        btn.setTextColor(Color.WHITE);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        btn.setAllCaps(false);
+        btn.setPadding(dp(14), dp(8), dp(14), dp(8));
+        btn.setMinHeight(0); btn.setMinimumHeight(0);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setShape(GradientDrawable.RECTANGLE);
+        bg.setCornerRadius(dp(10));
+        bg.setColor(Color.parseColor(bgColor));
+        btn.setBackground(bg);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        params.setMargins(0, dp(4), dp(8), dp(4));
+        btn.setLayoutParams(params);
+        return btn;
+    }
+
+    private Switch createSwitch(String text, String key, boolean def) {
+        Switch sw = new Switch(this);
+        sw.setText("  " + text);
+        sw.setTextColor(Color.parseColor(C_TEXT));
+        sw.setChecked(prefs.getBoolean(key, def));
+        sw.setOnCheckedChangeListener((b, c) -> prefs.edit().putBoolean(key, c).apply());
+        sw.setPadding(0, dp(6), 0, dp(6));
+        return sw;
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 各区块
+    // ════════════════════════════════════════════════════════════════
+
     private void buildHeader() {
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TL_BR,
+            new int[]{Color.parseColor(C_ACCENT), Color.parseColor(C_ACCENT2)});
+        bg.setCornerRadius(dp(18));
+        header.setBackground(bg);
+        header.setPadding(dp(22), dp(20), dp(22), dp(20));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(0, 0, 0, dp(16));
+        header.setLayoutParams(lp);
+
         TextView title = new TextView(this);
-        title.setText("🔓 WebDecrypt Pro v9.0");
-        title.setTextColor(Color.parseColor("#E94560"));
+        title.setText("🔓 WebDecrypt Pro");
+        title.setTextColor(Color.WHITE);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 26);
         title.setTypeface(null, Typeface.BOLD);
-        title.setPadding(0, 0, 0, 8);
-        rootLayout.addView(title);
+        header.addView(title);
+
+        TextView ver = new TextView(this);
+        ver.setText("v9.1 · LSP增强版");
+        ver.setTextColor(Color.parseColor("#FFE0E0"));
+        ver.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        ver.setPadding(0, dp(2), 0, dp(6));
+        header.addView(ver);
 
         TextView subtitle = new TextView(this);
-        subtitle.setText("LSP增强版 — 反检测 + X5兼容 + JS注入 + HTML捕捉 + 内置脚本 + 网页调试");
-        subtitle.setTextColor(Color.parseColor("#8888AA"));
-        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        subtitle.setPadding(0, 0, 0, 24);
-        rootLayout.addView(subtitle);
+        subtitle.setText("稳定注入 · 悬浮窗保障 · 多方案解密 · 实时日志\n反检测 + X5兼容 + JS注入 + HTML捕捉 + 30+脚本");
+        subtitle.setTextColor(Color.parseColor("#FFE8E8"));
+        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        header.addView(subtitle);
+
+        rootLayout.addView(header);
     }
 
     private void buildLspStatusSection() {
-        LinearLayout section = createSection("⚡ LSP激活状态");
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("⚡ LSP激活状态"));
         boolean isModuleActive = false;
         try { isModuleActive = isModuleActive(); } catch (Exception e) {}
 
         statusText = new TextView(this);
         if (isModuleActive) {
             statusText.setText("✅ 模块已激活 — LSPosed/Xposed框架已成功加载本模块");
-            statusText.setTextColor(Color.parseColor("#4CAF50"));
+            statusText.setTextColor(Color.parseColor(C_OK));
         } else {
             statusText.setText("❌ 模块未激活 — 需要在LSPosed中启用本模块");
-            statusText.setTextColor(Color.parseColor("#F44336"));
+            statusText.setTextColor(Color.parseColor(C_ERR));
         }
         statusText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        statusText.setPadding(0, 8, 0, 8);
-        section.addView(statusText);
+        statusText.setPadding(0, dp(10), 0, dp(8));
+        card.addView(statusText);
 
         if (!isModuleActive) {
-            LinearLayout guideLayout = new LinearLayout(this);
-            guideLayout.setOrientation(LinearLayout.VERTICAL);
-            guideLayout.setBackgroundColor(Color.parseColor("#1A1A2E"));
-            guideLayout.setPadding(20, 20, 20, 20);
+            LinearLayout guideBox = new LinearLayout(this);
+            guideBox.setOrientation(LinearLayout.VERTICAL);
+            GradientDrawable gbg = new GradientDrawable();
+            gbg.setCornerRadius(dp(12));
+            gbg.setColor(Color.parseColor(C_CARD_INNER));
+            guideBox.setBackground(gbg);
+            guideBox.setPadding(dp(16), dp(14), dp(16), dp(14));
 
             String[] steps = {
                 "激活步骤:",
@@ -118,18 +241,19 @@ public class MainActivity extends Activity {
                 "3. 打开 LSPosed Manager",
                 "4. 找到 \"WebDecrypt Pro\" 并启用模块",
                 "5. 设置作用域 → 勾选目标App",
-                "6. 强制停止目标App后重新打开",
-                "7. 悬浮窗自动出现 → 展开即可交互"
+                "6. 授予目标App「显示在其他应用上层」权限",
+                "7. 强制停止目标App后重新打开",
+                "8. 悬浮窗自动出现 → 点击小球展开面板"
             };
             for (String step : steps) {
                 TextView stepText = new TextView(this);
                 stepText.setText(step);
-                stepText.setTextColor(step.startsWith("激活") ? Color.parseColor("#E94560") : Color.parseColor("#CCCCEE"));
-                stepText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-                stepText.setPadding(0, 4, 0, 4);
-                guideLayout.addView(stepText);
+                stepText.setTextColor(step.startsWith("激活") ? Color.parseColor(C_ACCENT) : Color.parseColor(C_TEXT));
+                stepText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+                stepText.setPadding(0, dp(3), 0, dp(3));
+                guideBox.addView(stepText);
             }
-            section.addView(guideLayout);
+            card.addView(guideBox);
 
             Button btnOpenLsposed = createButton("打开 LSPosed Manager", "#0F3460");
             btnOpenLsposed.setOnClickListener(v -> {
@@ -139,54 +263,36 @@ public class MainActivity extends Activity {
                     else showAlertDialog("未找到LSPosed Manager", "请确保已安装LSPosed Manager");
                 } catch (Exception e) { showAlertDialog("无法打开", "请手动打开LSPosed Manager"); }
             });
-            section.addView(btnOpenLsposed);
+            card.addView(btnOpenLsposed);
         } else {
             TextView activeInfo = new TextView(this);
-            activeInfo.setText("模块已就绪。打开目标App后，悬浮窗将自动注入。\n展开悬浮窗可使用: 监控控制、JS注入、HTML捕捉、内置脚本、网页调试、优化建议");
-            activeInfo.setTextColor(Color.parseColor("#AADDAA"));
-            activeInfo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-            activeInfo.setPadding(0, 8, 0, 0);
-            section.addView(activeInfo);
+            activeInfo.setText("模块已就绪。打开目标App后，悬浮窗将自动注入。\n\n💡 悬浮窗采用3重注入保障(onResume/获焦/附加窗口)，并带失败重试与权限引导，确保稳定出现。");
+            activeInfo.setTextColor(Color.parseColor(C_OK));
+            activeInfo.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            activeInfo.setLineSpacing(dp(2), 1f);
+            activeInfo.setPadding(0, dp(6), 0, 0);
+            card.addView(activeInfo);
         }
-        rootLayout.addView(section);
+        rootLayout.addView(card);
     }
 
     private boolean isModuleActive() { return false; }
 
     private void buildAntiDetectionSection() {
-        LinearLayout section = createSection("🛡️ 反检测引擎");
-
-        TextView desc = new TextView(this);
-        desc.setText("在目标App启动前注入反检测逻辑，伪装正常环境，隐藏框架特征。\n\n" +
-            "覆盖检测层:\n" +
-            "• 进程/端口 — 过滤/proc/maps、TracerPid、Frida端口\n" +
-            "• 内存/符号 — 过滤dl_iterate_phdr、BufferedReader输出\n" +
-            "• 文件/描述符 — 隐藏su/frida/magisk等敏感文件\n" +
-            "• Java层扫描 — 过滤ClassLoader.loadClass异常类\n" +
-            "• 行为/时间 — 绕过反调试、debugger语句\n" +
-            "• 设备指纹 — 伪装Build属性、ro.build.tags\n" +
-            "• 线程栈 — 过滤StackTrace中的Xposed特征\n" +
-            "• PackageManager — 隐藏Magisk/Xposed等应用");
-        desc.setTextColor(Color.parseColor("#CCCCEE"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        desc.setPadding(0, 0, 0, 12);
-        section.addView(desc);
-
-        Switch switchAnti = new Switch(this);
-        switchAnti.setText("  启用反检测引擎");
-        switchAnti.setTextColor(Color.WHITE);
-        switchAnti.setChecked(prefs.getBoolean(KEY_ANTI_DETECTION, true));
-        switchAnti.setOnCheckedChangeListener((buttonView, isChecked) -> prefs.edit().putBoolean(KEY_ANTI_DETECTION, isChecked).apply());
-        section.addView(switchAnti);
-
-        rootLayout.addView(section);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🛡️ 反检测引擎"));
+        card.addView(createDesc("在目标App启动前注入反检测逻辑，伪装正常环境，隐藏框架特征。\n覆盖进程/端口、内存/符号、文件/描述符、Java层、行为/时间、设备指纹、线程栈、PackageManager 共8大检测层。"));
+        card.addView(createSwitch("启用反检测引擎", KEY_ANTI_DETECTION, true));
+        rootLayout.addView(card);
     }
 
     private void buildQuickActions() {
-        LinearLayout section = createSection("🎯 快捷操作");
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🎯 快捷操作"));
+
         LinearLayout row = new LinearLayout(this);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, 8, 0, 8);
+        row.setPadding(0, dp(6), 0, dp(6));
 
         Button btnOpenDir = createButton("📁 输出目录", "#0F3460");
         btnOpenDir.setOnClickListener(v -> openOutputDirectory());
@@ -195,67 +301,47 @@ public class MainActivity extends Activity {
         Button btnClearData = createButton("🗑 清空数据", "#5C1A1A");
         btnClearData.setOnClickListener(v -> showClearDataDialog());
         row.addView(btnClearData, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        section.addView(row);
+        card.addView(row);
 
-        Button btnViewLog = createButton("📋 查看运行日志", "#16213E");
+        Button btnViewLog = createButton("📋 查看运行日志（彩色分级）", "#16213E");
         btnViewLog.setOnClickListener(v -> showLogFile());
-        section.addView(btnViewLog);
-        rootLayout.addView(section);
+        card.addView(btnViewLog);
+        rootLayout.addView(card);
     }
 
     private void buildCaptureSettings() {
-        LinearLayout section = createSection("⚙️ 拦截设置");
-
-        Switch switchAutoCapture = new Switch(this);
-        switchAutoCapture.setText("  自动捕获");
-        switchAutoCapture.setTextColor(Color.WHITE);
-        switchAutoCapture.setChecked(prefs.getBoolean(KEY_AUTO_CAPTURE, true));
-        switchAutoCapture.setOnCheckedChangeListener((b, c) -> prefs.edit().putBoolean(KEY_AUTO_CAPTURE, c).apply());
-        section.addView(switchAutoCapture);
-
-        Switch switchAutoInject = new Switch(this);
-        switchAutoInject.setText("  自动注入JS");
-        switchAutoInject.setTextColor(Color.WHITE);
-        switchAutoInject.setChecked(prefs.getBoolean(KEY_AUTO_INJECT, false));
-        switchAutoInject.setOnCheckedChangeListener((b, c) -> prefs.edit().putBoolean(KEY_AUTO_INJECT, c).apply());
-        section.addView(switchAutoInject);
-
-        Switch switchCaptureHtml = new Switch(this);
-        switchCaptureHtml.setText("  实时HTML捕捉");
-        switchCaptureHtml.setTextColor(Color.WHITE);
-        switchCaptureHtml.setChecked(prefs.getBoolean(KEY_CAPTURE_HTML, true));
-        switchCaptureHtml.setOnCheckedChangeListener((b, c) -> prefs.edit().putBoolean(KEY_CAPTURE_HTML, c).apply());
-        section.addView(switchCaptureHtml);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("⚙️ 拦截设置"));
+        card.addView(createSwitch("自动捕获", KEY_AUTO_CAPTURE, true));
+        card.addView(createSwitch("自动注入JS", KEY_AUTO_INJECT, false));
+        card.addView(createSwitch("实时HTML捕捉", KEY_CAPTURE_HTML, true));
 
         TextView kwLabel = new TextView(this);
-        kwLabel.setText("目标Activity关键词 (逗号分隔):");
-        kwLabel.setTextColor(Color.parseColor("#8888AA"));
+        kwLabel.setText("目标Activity关键词 (逗号分隔，匹配到则注入悬浮窗):");
+        kwLabel.setTextColor(Color.parseColor(C_TEXT_DIM));
         kwLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        kwLabel.setPadding(0, 12, 0, 4);
-        section.addView(kwLabel);
+        kwLabel.setPadding(0, dp(10), 0, dp(4));
+        card.addView(kwLabel);
 
         EditText kwInput = new EditText(this);
         kwInput.setText(prefs.getString(KEY_TARGET_KEYWORDS, "Web,Main,Browser,Home,Content"));
-        kwInput.setTextColor(Color.WHITE);
+        kwInput.setTextColor(Color.parseColor(C_TEXT));
         kwInput.setHint("Web,Main,Browser...");
         kwInput.setHintTextColor(Color.parseColor("#555577"));
-        kwInput.setBackgroundColor(Color.parseColor("#1A1A2E"));
-        kwInput.setPadding(16, 12, 16, 12);
+        GradientDrawable ebg = new GradientDrawable();
+        ebg.setCornerRadius(dp(8));
+        ebg.setColor(Color.parseColor(C_CARD_INNER));
+        kwInput.setBackground(ebg);
+        kwInput.setPadding(dp(12), dp(10), dp(12), dp(10));
         kwInput.setOnFocusChangeListener((v, hasFocus) -> { if (!hasFocus) prefs.edit().putString(KEY_TARGET_KEYWORDS, kwInput.getText().toString()).apply(); });
-        section.addView(kwInput);
-
-        rootLayout.addView(section);
+        card.addView(kwInput);
+        rootLayout.addView(card);
     }
 
     private void buildJsInjectionSection() {
-        LinearLayout section = createSection("💉 JS注入引擎");
-
-        TextView desc = new TextView(this);
-        desc.setText("自定义JavaScript代码，在目标App的WebView中自动注入执行。\n支持多段脚本，每段用 #---# 分隔。\n兼容系统WebView和腾讯X5内核。");
-        desc.setTextColor(Color.parseColor("#8888AA"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        desc.setPadding(0, 0, 0, 12);
-        section.addView(desc);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("💉 JS注入引擎"));
+        card.addView(createDesc("自定义JavaScript代码，在目标App的WebView中自动注入执行。\n支持多段脚本，每段用 #---# 分隔。\n兼容系统WebView和腾讯X5内核。"));
 
         String savedScripts = prefs.getString(KEY_JS_SCRIPTS,
             "// 示例: 捕获所有按钮点击\n" +
@@ -272,18 +358,21 @@ public class MainActivity extends Activity {
 
         EditText scriptInput = new EditText(this);
         scriptInput.setText(savedScripts);
-        scriptInput.setTextColor(Color.parseColor("#AADDAA"));
-        scriptInput.setBackgroundColor(Color.parseColor("#1A1A2E"));
+        scriptInput.setTextColor(Color.parseColor(C_OK));
+        GradientDrawable ebg = new GradientDrawable();
+        ebg.setCornerRadius(dp(8));
+        ebg.setColor(Color.parseColor(C_CARD_INNER));
+        scriptInput.setBackground(ebg);
         scriptInput.setTypeface(Typeface.MONOSPACE);
         scriptInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        scriptInput.setPadding(16, 12, 16, 12);
+        scriptInput.setPadding(dp(12), dp(10), dp(12), dp(10));
         scriptInput.setMinLines(8);
         scriptInput.setGravity(Gravity.TOP | Gravity.START);
-        section.addView(scriptInput);
+        card.addView(scriptInput);
 
         LinearLayout btnRow = new LinearLayout(this);
         btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setPadding(0, 8, 0, 0);
+        btnRow.setPadding(0, dp(8), 0, 0);
 
         Button btnSave = createButton("💾 保存脚本", "#0F3460");
         btnSave.setOnClickListener(v -> { prefs.edit().putString(KEY_JS_SCRIPTS, scriptInput.getText().toString()).apply(); showAlertDialog("已保存", "JS脚本已保存，下次目标App启动时生效"); });
@@ -292,158 +381,113 @@ public class MainActivity extends Activity {
         Button btnClear = createButton("🗑 清空", "#5C1A1A");
         btnClear.setOnClickListener(v -> { scriptInput.setText(""); prefs.edit().remove(KEY_JS_SCRIPTS).apply(); });
         btnRow.addView(btnClear, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        section.addView(btnRow);
+        card.addView(btnRow);
 
-        TextView tip = new TextView(this);
-        tip.setText("💡 提示: 注入的JS可通过 console.log('[WD]...') 输出到日志\n使用 window.__wd_capture(html) 可手动捕捉HTML\n使用 window.__wd_log(msg) 可输出到模块日志");
-        tip.setTextColor(Color.parseColor("#666688"));
-        tip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        tip.setPadding(0, 8, 0, 0);
-        section.addView(tip);
+        card.addView(createDesc("💡 提示: 注入的JS可通过 console.log('[WD]...') 输出到日志\n使用 window.__wd_capture(html) 可手动捕捉HTML\n使用 window.__wd_log(msg) 可输出到模块日志"));
+        rootLayout.addView(card);
+    }
 
-        rootLayout.addView(section);
+    private void buildDecryptSection() {
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🔓 多方案解密引擎"));
+        card.addView(createDesc("对捕获的加密资源自动尝试多种解密方案，多方案纠错，最大化 dump 成功率：\n\n" +
+            "• 明文识别 — 直接识别可读 Web 内容\n" +
+            "• Base64 变体 — 标准/URL安全/无填充/无换行\n" +
+            "• XOR 暴力 — 单字节1~255 + 常见多字节口令\n" +
+            "• AES/DES — 复用 Cipher hook 捕获的密钥(ECB/CBC)\n" +
+            "• RC4 — 常见弱口令尝试\n" +
+            "• 熵值分析 — 香农熵判断加密/压缩特征\n\n" +
+            "扩展识别文件类型: .vm/.enc/.dat/.bin/.bundle/.asar/.wasm/.vue/.db/.sqlite/.pem/.key 等\n" +
+            "捕获的密钥保存到 /sdcard/WebDecrypt/keys/ 供人工分析"));
+        rootLayout.addView(card);
     }
 
     private void buildBuiltInScriptsSection() {
-        LinearLayout section = createSection("📜 内置脚本库 (30+)");
-
-        TextView desc = new TextView(this);
-        desc.setText("30+内置脚本，按分类组织，在悬浮窗中一键执行:\n\n" +
-            "🔍 调试类 (8个):\n" +
-            "  DOM查看器 | 事件监听器 | Cookie查看器\n" +
-            "  LocalStorage查看 | SessionStorage查看\n" +
-            "  网络请求监控 | Console日志捕获 | 性能分析\n\n" +
-            "✏️ 修改类 (8个):\n" +
-            "  编辑模式 | 显示隐藏元素 | 移除遮罩层\n" +
-            "  禁用右键限制 | 修改User-Agent | 注入jQuery\n" +
-            "  修改Viewport | 强制暗黑模式\n\n" +
-            "📥 下载类 (6个):\n" +
-            "  提取所有图片 | 提取所有链接 | 提取视频源\n" +
-            "  提取音频源 | 提取CSS样式 | 提取JS代码\n\n" +
-            "🧭 导航类 (5个):\n" +
-            "  页面元素高亮 | 表单自动填充 | 滚动到底部\n" +
-            "  查找文本 | 页面截图标记\n\n" +
-            "🔓 解锁类 (6个):\n" +
-            "  VIP内容解锁 | 阅读模式 | 禁用弹窗\n" +
-            "  恢复弹窗 | 禁用跳转 | 反反调试\n\n" +
-            "🔧 工具类 (10个):\n" +
-            "  页面信息 | 颜色拾取器 | 清除所有Cookie\n" +
-            "  清除存储 | 强制重载 | 查看源码\n" +
-            "  API接口探测 | WebSocket监控 | 时间加速 | 编码解码工具");
-        desc.setTextColor(Color.parseColor("#CCCCEE"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        section.addView(desc);
-
-        rootLayout.addView(section);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("📜 内置脚本库 (30+)"));
+        card.addView(createDesc("30+内置脚本，按分类组织，在悬浮窗中一键执行:\n\n" +
+            "🔍 调试类(8): DOM查看器|事件监听器|Cookie|LocalStorage|SessionStorage|网络监控|Console捕获|性能分析\n" +
+            "✏️ 修改类(8): 编辑模式|显示隐藏|移除遮罩|禁右键|改UA|注入jQuery|改Viewport|暗黑模式\n" +
+            "📥 下载类(6): 图片|链接|视频|音频|CSS|JS\n" +
+            "🧭 导航类(5): 元素高亮|表单填充|滚到底部|查找文本|截图标记\n" +
+            "🔓 解锁类(6): VIP解锁|阅读模式|禁弹窗|恢复弹窗|禁跳转|反反调试\n" +
+            "🔧 工具类(10): 页面信息|颜色拾取|清Cookie|清存储|强重载|源码|API探测|WS监控|时间加速|编解码"));
+        rootLayout.addView(card);
     }
 
     private void buildHtmlCaptureSection() {
-        LinearLayout section = createSection("🌐 HTML实时捕捉");
-
-        TextView desc = new TextView(this);
-        desc.setText("实时捕捉目标App中WebView当前渲染的完整HTML源码。\n\n" +
-            "捕捉方式:\n" +
-            "• 自动捕捉: WebView每次加载时自动保存HTML\n" +
-            "• 手动捕捉: 通过悬浮窗「🌐 捕捉HTML」按钮触发\n" +
-            "• JS触发: 在注入脚本中调用 window.__wd_capture(html)\n" +
-            "• 源码按钮: 悬浮窗「📋 源码」一键获取\n\n" +
-            "兼容系统WebView和腾讯X5内核。\n" +
-            "捕捉的HTML保存到: /sdcard/WebDecrypt/captured/");
-        desc.setTextColor(Color.parseColor("#CCCCEE"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        section.addView(desc);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🌐 HTML实时捕捉"));
+        card.addView(createDesc("实时捕捉目标App中WebView当前渲染的完整HTML源码。\n\n捕捉方式:\n• 自动捕捉: WebView每次加载时自动保存\n• 手动捕捉: 悬浮窗「🌐 捕HTML」按钮\n• JS触发: window.__wd_capture(html)\n• 源码按钮: 悬浮窗「📋 源码」\n\n兼容系统WebView和腾讯X5内核。\n保存到 /sdcard/WebDecrypt/captured/"));
 
         Button btnViewCaptured = createButton("📂 查看已捕捉的HTML", "#0F3460");
         btnViewCaptured.setOnClickListener(v -> openCapturedDirectory());
-        section.addView(btnViewCaptured);
-
-        rootLayout.addView(section);
+        card.addView(btnViewCaptured);
+        rootLayout.addView(card);
     }
 
     private void buildWebDebugSection() {
-        LinearLayout section = createSection("🔧 网页调试工具箱");
-
-        TextView desc = new TextView(this);
-        desc.setText("悬浮窗中点击「🔧 网页调试」打开多选工具箱，可同时启用多个调试功能:\n\n" +
-            "• 🌐 捕捉当前HTML — 获取完整页面源码\n" +
-            "• 📊 页面性能分析 — DNS/TCP/加载耗时\n" +
-            "• 🔍 DOM结构查看 — 节点/深度/脚本统计\n" +
-            "• 📡 网络请求监控 — Hook XHR/Fetch\n" +
-            "• 📜 Console日志捕获 — 拦截log/warn/error\n" +
-            "• 🔧 反反调试 — 绕过debugger和反调试\n" +
-            "• ✏️ 开启编辑模式 — 直接修改页面内容\n" +
-            "• 🔓 VIP内容解锁 — 移除付费遮罩\n" +
-            "• 📖 阅读模式 — 纯净阅读体验\n" +
-            "• 🚫 禁用弹窗 — 阻止alert/confirm/prompt\n" +
-            "• ⚡ 时间加速 — 跳过等待/倒计时\n" +
-            "• 🎨 颜色拾取器 — 点击获取元素颜色");
-        desc.setTextColor(Color.parseColor("#CCCCEE"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        section.addView(desc);
-
-        rootLayout.addView(section);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🔧 网页调试工具箱"));
+        card.addView(createDesc("悬浮窗中点击「🔧 调试」打开多选工具箱，可同时启用多个调试功能:\n\n" +
+            "• 🌐 捕捉HTML  • 📊 性能分析  • 🔍 DOM查看\n" +
+            "• 📡 网络监控  • 📜 Console捕获  • 🔧 反反调试\n" +
+            "• ✏️ 编辑模式  • 🔓 VIP解锁  • 📖 阅读模式\n" +
+            "• 🚫 禁弹窗  • ⚡ 时间加速  • 🎨 颜色拾取"));
+        rootLayout.addView(card);
     }
 
     private void buildOptimizationSection() {
-        LinearLayout section = createSection("🧠 交互优化建议");
-
-        TextView desc = new TextView(this);
-        desc.setText("悬浮窗展开后，点击「🧠 优化分析」自动分析当前WebView内容:\n\n" +
-            "• 📊 页面结构分析 — DOM层级深度、节点数量\n" +
-            "• 🔒 安全检测 — 不安全的HTTP请求、明文密码字段\n" +
-            "• ⚡ 性能建议 — 大图片资源、未压缩资源、阻塞JS\n" +
-            "• 🔗 API端点发现 — 检测XHR/Fetch请求的API地址\n" +
-            "• 📱 适配检测 — viewport设置、移动端兼容性\n" +
-            "• 🎯 事件监听分析 — 绑定的事件类型和数量\n\n" +
-            "分析结果实时显示在悬浮窗面板中，并提供可操作的优化建议。");
-        desc.setTextColor(Color.parseColor("#CCCCEE"));
-        desc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        section.addView(desc);
-
-        rootLayout.addView(section);
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("🧠 交互优化建议"));
+        card.addView(createDesc("悬浮窗展开后，点击「🧠 优化」自动分析当前WebView内容:\n\n" +
+            "• 📊 页面结构 — DOM层级深度、节点数量\n" +
+            "• 🔒 安全检测 — HTTP请求、明文密码字段\n" +
+            "• ⚡ 性能建议 — 大图片、阻塞JS\n" +
+            "• 🔗 API端点 — XHR/Fetch请求地址\n" +
+            "• 📱 适配检测 — viewport、移动端兼容\n" +
+            "• 🎯 事件监听 — 绑定的事件类型和数量\n\n" +
+            "分析结果实时显示在悬浮窗面板，并提供可操作建议。"));
+        rootLayout.addView(card);
     }
 
     private void buildCapturedFilesSection() {
-        LinearLayout section = createSection("📁 已捕获文件");
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("📁 已捕获文件"));
 
         File outputDir = new File(OUTPUT_DIR);
         if (outputDir.exists()) {
             StringBuilder sb = new StringBuilder();
-            String[] subDirs = {"assets", "webview", "intercepted", "response", "decrypted", "decoded", "scanned", "chromium", "captured"};
+            String[] subDirs = {"assets", "webview", "intercepted", "response", "decrypted", "decoded", "scanned", "chromium", "captured", "keys"};
+            int total = 0;
             for (String sub : subDirs) {
                 File dir = new File(OUTPUT_DIR + sub);
                 if (dir.exists()) {
                     File[] files = dir.listFiles();
                     int count = (files != null) ? files.length : 0;
-                    if (count > 0) sb.append(sub).append(": ").append(count).append(" 个文件\n");
+                    if (count > 0) { sb.append(sub).append(": ").append(count).append(" 个\n"); total += count; }
                 }
             }
             if (sb.length() == 0) sb.append("暂无捕获文件，打开目标App后自动开始捕获");
+            else sb.insert(0, "总计 " + total + " 个文件\n\n");
             TextView filesText = new TextView(this);
             filesText.setText(sb.toString());
-            filesText.setTextColor(Color.parseColor("#AADDAA"));
-            filesText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-            filesText.setPadding(0, 4, 0, 0);
-            section.addView(filesText);
+            filesText.setTextColor(Color.parseColor(C_OK));
+            filesText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            filesText.setTypeface(Typeface.MONOSPACE);
+            filesText.setPadding(0, dp(6), 0, 0);
+            card.addView(filesText);
         } else {
-            TextView emptyText = new TextView(this);
-            emptyText.setText("暂无捕获文件，打开目标App后自动开始捕获");
-            emptyText.setTextColor(Color.parseColor("#8888AA"));
-            emptyText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-            section.addView(emptyText);
+            card.addView(createDesc("暂无捕获文件，打开目标App后自动开始捕获"));
         }
-        rootLayout.addView(section);
+        rootLayout.addView(card);
     }
 
     private void buildAboutSection() {
-        LinearLayout section = createSection("ℹ️ 关于");
-
-        TextView about = new TextView(this);
-        about.setText("WebDecrypt Pro v9.0 — LSP增强版\n\n" +
-            "核心原理:\n" +
-            "当App从加密的assets加载HTML时，App会在内存中解压/解密后\n" +
-            "交给WebView渲染。本模块拦截系统函数，直接获取解密后的\n" +
-            "原始数据。\n\n" +
+        LinearLayout card = createCard();
+        card.addView(createCardTitle("ℹ️ 关于"));
+        card.addView(createDesc("WebDecrypt Pro v9.1 — LSP增强版\n\n" +
+            "核心原理:\n当App从加密的assets加载HTML时，App会在内存中解压/解密后交给WebView渲染。本模块拦截系统函数，直接获取解密后的原始数据。\n\n" +
             "拦截层级 (7层):\n" +
             "• 资源层: AssetManager.open()\n" +
             "• 渲染层: WebView.loadUrl/loadData (系统+X5)\n" +
@@ -452,53 +496,24 @@ public class MainActivity extends Activity {
             "• 加密层: Cipher.doFinal\n" +
             "• 编码层: Base64.decode\n" +
             "• 内核层: AwContents/ContentViewCore\n\n" +
-            "v9.0新增:\n" +
-            "• 🛡️ 反检测引擎 (12个Hook点)\n" +
+            "v9.1升级:\n" +
+            "• 🛡️ 反检测引擎 (8大检测层)\n" +
             "• 📱 腾讯X5内核兼容\n" +
             "• 📜 30+内置脚本库\n" +
             "• 🔧 网页调试工具箱\n" +
             "• 💉 JS注入引擎 (系统+X5)\n" +
             "• 🌐 HTML实时捕捉\n" +
             "• 🧠 交互优化建议\n" +
-            "• ⚡ LSP激活检测与引导");
-        about.setTextColor(Color.parseColor("#8888AA"));
-        about.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        section.addView(about);
-        rootLayout.addView(section);
+            "• ⚡ LSP激活检测与引导\n" +
+            "• 🪟 悬浮窗3重注入保障+重试+权限引导\n" +
+            "• 📋 实时日志面板+彩色分级\n" +
+            "• 🔓 多方案解密引擎(XOR/Base64/AES/DES/RC4)"));
+        rootLayout.addView(card);
     }
 
-    private LinearLayout createSection(String title) {
-        LinearLayout section = new LinearLayout(this);
-        section.setOrientation(LinearLayout.VERTICAL);
-        section.setBackgroundColor(Color.parseColor("#12122A"));
-        section.setPadding(24, 20, 24, 20);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        params.setMargins(0, 0, 0, 16);
-        section.setLayoutParams(params);
-
-        TextView titleView = new TextView(this);
-        titleView.setText(title);
-        titleView.setTextColor(Color.parseColor("#E94560"));
-        titleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        titleView.setTypeface(null, Typeface.BOLD);
-        titleView.setPadding(0, 0, 0, 12);
-        section.addView(titleView);
-
-        return section;
-    }
-
-    private Button createButton(String text, String bgColor) {
-        Button btn = new Button(this);
-        btn.setText(text);
-        btn.setBackgroundColor(Color.parseColor(bgColor));
-        btn.setTextColor(Color.WHITE);
-        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        btn.setPadding(16, 8, 16, 8);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        params.setMargins(0, 4, 8, 4);
-        btn.setLayoutParams(params);
-        return btn;
-    }
+    // ════════════════════════════════════════════════════════════════
+    // 操作
+    // ════════════════════════════════════════════════════════════════
 
     private void openOutputDirectory() {
         try {
@@ -536,30 +551,58 @@ public class MainActivity extends Activity {
         file.delete();
     }
 
+    /** 新手友好的彩色分级日志查看器 */
     private void showLogFile() {
         File logFile = new File(OUTPUT_DIR + "log.txt");
-        if (!logFile.exists()) { showAlertDialog("日志文件不存在", "请先打开目标App运行一段时间后再查看"); return; }
+        if (!logFile.exists()) { showAlertDialog("日志文件不存在", "请先打开目标App运行一段时间后再查看。\n\n💡 日志会实时写入 /sdcard/WebDecrypt/log.txt"); return; }
         try {
+            // 读取全部行，取最后500行
+            List<String> allLines = new ArrayList<>();
             BufferedReader reader = new BufferedReader(new FileReader(logFile));
-            StringBuilder sb = new StringBuilder();
-            String line; int lineCount = 0;
-            while ((line = reader.readLine()) != null && lineCount < 200) { sb.append(line).append("\n"); lineCount++; }
+            String line;
+            while ((line = reader.readLine()) != null) allLines.add(line);
             reader.close();
+            int start = Math.max(0, allLines.size() - 500);
+            List<String> lines = allLines.subList(start, allLines.size());
 
-            AlertDialog.Builder builder = new AlertDialog.Builder(this);
-            builder.setTitle("📋 运行日志 (最近200行)");
+            SpannableStringBuilder sb = new SpannableStringBuilder();
+            for (String l : lines) {
+                int color = colorForLine(l);
+                int s = sb.length();
+                sb.append(l).append("\n");
+                sb.setSpan(new ForegroundColorSpan(color), s, sb.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+            }
+            if (sb.length() == 0) sb.append("日志为空");
+
             TextView logView = new TextView(this);
-            logView.setText(sb.toString());
-            logView.setTextColor(Color.parseColor("#AADDAA"));
+            logView.setText(sb);
             logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
             logView.setTypeface(Typeface.MONOSPACE);
-            logView.setPadding(24, 16, 24, 16);
+            logView.setPadding(dp(16), dp(12), dp(16), dp(12));
             ScrollView scroll = new ScrollView(this);
             scroll.addView(logView);
+
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            builder.setTitle("📋 运行日志 (最近" + lines.size() + "行 · 彩色分级)");
             builder.setView(scroll);
-            builder.setPositiveButton("关闭", null);
+            builder.setPositiveButton("刷新", (d, w) -> showLogFile());
+            builder.setNegativeButton("关闭", null);
             builder.show();
+            // 滚动到底部
+            scroll.post(() -> scroll.fullScroll(ScrollView.FOCUS_DOWN));
         } catch (Exception e) { showAlertDialog("读取失败", e.getMessage()); }
+    }
+
+    /** 根据日志级别返回颜色 */
+    private int colorForLine(String line) {
+        if (line == null) return Color.parseColor(C_TEXT);
+        if (line.contains("[ERR]") || line.contains("❌")) return Color.parseColor(C_ERR);
+        if (line.contains("[WARN]") || line.contains("⚠️")) return Color.parseColor(C_WARN);
+        if (line.contains("[OK]") || line.contains("✅")) return Color.parseColor(C_OK);
+        if (line.contains("[指南]") || line.contains("💡")) return Color.parseColor("#7BC8F6");
+        if (line.contains("[TRC]") || line.contains("→")) return Color.parseColor("#6A6A90");
+        if (line.contains("[DBG]") || line.contains("🔍")) return Color.parseColor("#9A8AC0");
+        return Color.parseColor(C_TEXT);
     }
 
     private void showAlertDialog(String title, String message) {

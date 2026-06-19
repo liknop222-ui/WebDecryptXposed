@@ -3,21 +3,22 @@ package com.webdecrypt.xposed;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
-import android.content.DialogInterface;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -40,7 +41,9 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -76,28 +79,36 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     private static final AtomicInteger failedCount = new AtomicInteger(0);
     private static final AtomicBoolean autoCapture = new AtomicBoolean(true);
 
-    private static final List<String> TARGET_EXTENSIONS = Arrays.asList(
-            ".vm", ".enc", ".dat", ".html", ".htm", ".js", ".css", ".json", ".xml"
-    );
+    // 从 Cipher hook 捕获到的密钥：algorithm -> 多个 key
+    private static final Map<String, List<byte[]>> capturedKeys = new HashMap<>();
 
     private static final LinkedList<String> LOG_BUFFER = new LinkedList<>();
     private static final Set<String> CAPTURED_FILES = new HashSet<>();
 
     private static WeakReference<Activity> currentActivityRef;
+    private static WeakReference<Context> appContextRef;
     private static WindowManager windowManager;
     private static View floatingBallView;
     private static View floatingPanelView;
     private static volatile boolean isPanelExpanded = false;
     private static volatile boolean isFloatingShown = false;
+    private static volatile int injectRetryCount = 0;
+    private static final int MAX_INJECT_RETRY = 3;
+    private static volatile boolean scanStarted = false;
     private static TextView statsTextView;
     private static TextView fileListTextView;
     private static TextView optimizationTextView;
+    private static TextView liveLogTextView;
     private static Handler mainHandler;
     private static SharedPreferences modulePrefs;
 
     private static final List<String> capturedFileNames = new ArrayList<>();
     private static final List<Object> trackedWebViews = new ArrayList<>();
     private static final List<String> trackedWebViewTypes = new ArrayList<>();
+
+    // 实时日志缓冲（供悬浮窗日志面板展示）
+    private static final LinkedList<String> LIVE_LOG = new LinkedList<>();
+    private static final int LIVE_LOG_MAX = 200;
 
     private static final String OPTIMIZATION_JS =
         "(function(){" +
@@ -121,8 +132,12 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         "window.__wd_capture=function(h){if(window.__wd_android&&window.__wd_android.captureHtml)window.__wd_android.captureHtml(h)};" +
         "window.__wd_log=function(m){if(window.__wd_android&&window.__wd_android.log)window.__wd_android.log(m)};";
 
+    // ════════════════════════════════════════════════════════════════
+    // 日志系统（新手友好 + 分级 + 实时面板）
+    // ════════════════════════════════════════════════════════════════
+
     private static void log(String level, String msg) {
-        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS").format(new Date());
+        String timestamp = new SimpleDateFormat("HH:mm:ss.SSS").format(new Date());
         String line = "[" + timestamp + "] [" + level + "] " + msg;
         XposedBridge.log(line);
         Log.d(TAG, line);
@@ -130,9 +145,16 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             LOG_BUFFER.add(line);
             if (LOG_BUFFER.size() >= 100) flushLog();
         }
+        synchronized (LIVE_LOG) {
+            LIVE_LOG.add(line);
+            if (LIVE_LOG.size() > LIVE_LOG_MAX) LIVE_LOG.removeFirst();
+        }
+        updateLiveLogView();
     }
 
     private static void info(String msg) { log("INFO", msg); }
+    /** 新手友好说明日志：用通俗语言解释当前发生了什么 */
+    private static void guide(String msg) { log("指南", "💡 " + msg); }
     private static void ok(String msg) { capturedCount.incrementAndGet(); log("OK", "✅ " + msg); }
     private static void warn(String msg) { log("WARN", "⚠️ " + msg); }
     private static void err(String msg) { failedCount.incrementAndGet(); log("ERR", "❌ " + msg); }
@@ -150,6 +172,24 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             } catch (Exception e) {}
         }
     }
+
+    private static void updateLiveLogView() {
+        if (liveLogTextView == null || mainHandler == null) return;
+        mainHandler.post(() -> {
+            try {
+                StringBuilder sb = new StringBuilder();
+                synchronized (LIVE_LOG) {
+                    int start = Math.max(0, LIVE_LOG.size() - 12);
+                    for (int i = start; i < LIVE_LOG.size(); i++) sb.append(LIVE_LOG.get(i)).append("\n");
+                }
+                liveLogTextView.setText(sb.toString());
+            } catch (Exception e) {}
+        });
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 文件工具
+    // ════════════════════════════════════════════════════════════════
 
     private static void saveFile(String path, byte[] data, boolean append) {
         try {
@@ -179,10 +219,7 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     }
 
     private static boolean isTargetFile(String filename) {
-        if (filename == null) return false;
-        String lower = filename.toLowerCase();
-        for (String ext : TARGET_EXTENSIONS) { if (lower.endsWith(ext)) return true; }
-        return lower.contains("index") || lower.contains("main") || lower.contains("app") || lower.contains("view");
+        return AssetDecrypter.isTargetFile(filename);
     }
 
     private static String generateSafeFilename(String input) {
@@ -192,25 +229,17 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     }
 
     private static boolean isHtmlContent(byte[] data) {
-        if (data == null || data.length < 5) return false;
-        try {
-            String head = new String(data, 0, Math.min(data.length, 500), "UTF-8").toLowerCase();
-            return head.contains("<html") || head.contains("<!doctype") || head.contains("<head") ||
-                    head.contains("<body") || head.contains("<script") || head.contains("<div") ||
-                    head.contains("function(") || head.contains("var ");
-        } catch (Exception e) { return false; }
+        return AssetDecrypter.looksLikeWebContent(data);
     }
 
     private static String bytesToHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < Math.min(bytes.length, 32); i++) sb.append(String.format("%02x", bytes[i] & 0xff));
-        return sb.toString();
+        return AssetDecrypter.headHex(bytes);
     }
 
     private static void ensureDirs() {
         String[] dirs = {OUTPUT_DIR, OUTPUT_DIR+"assets/", OUTPUT_DIR+"webview/", OUTPUT_DIR+"intercepted/",
                 OUTPUT_DIR+"response/", OUTPUT_DIR+"decrypted/", OUTPUT_DIR+"decoded/",
-                OUTPUT_DIR+"scanned/", OUTPUT_DIR+"chromium/", OUTPUT_DIR+"captured/"};
+                OUTPUT_DIR+"scanned/", OUTPUT_DIR+"chromium/", OUTPUT_DIR+"captured/", OUTPUT_DIR+"keys/"};
         for (String dir : dirs) new File(dir).mkdirs();
     }
 
@@ -252,6 +281,10 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         return true;
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // Hook：AssetManager（更多 dump + 解密）
+    // ════════════════════════════════════════════════════════════════
+
     private static void hookAssetManager(ClassLoader cl) {
         try {
             XposedHelpers.findAndHookMethod("android.content.res.AssetManager", cl, "open", String.class,
@@ -268,7 +301,15 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                                     byte[] data = readInputStream(is);
                                     if (data != null && data.length > 0 && data.length < 50*1024*1024) {
                                         String op = OUTPUT_DIR + "assets/" + generateSafeFilename(filename);
-                                        synchronized (CAPTURED_FILES) { if (CAPTURED_FILES.add(op)) { saveFile(op, data); ok("Asset捕获: " + filename + " (" + data.length + "B)"); addCapturedFileName("assets/" + filename); } }
+                                        synchronized (CAPTURED_FILES) {
+                                            if (CAPTURED_FILES.add(op)) {
+                                                saveFile(op, data);
+                                                ok("Asset捕获: " + filename + " (" + data.length + "B) head=" + bytesToHex(data));
+                                                addCapturedFileName("assets/" + filename);
+                                                // 触发更多解密 dump
+                                                dumpAndDecrypt("assets/" + filename, data);
+                                            }
+                                        }
                                         param.setResult(new ByteArrayInputStream(data));
                                     }
                                 }
@@ -279,8 +320,34 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             try { XposedHelpers.findAndHookMethod("android.content.res.AssetManager", cl, "open", String.class, int.class,
                 new XC_MethodHook() { @Override protected void beforeHookedMethod(MethodHookParam p) { trace("AssetManager.open(mode): " + p.args[0]); } }); } catch (Exception e) {}
             info("✅ AssetManager Hook 完成");
+            guide("已挂载资源加载拦截：当目标App读取加密的本地资源时，会自动保存并尝试解密");
         } catch (Exception e) { warn("AssetManager Hook 失败: " + e.getMessage()); }
     }
+
+    /** 对捕获的数据执行多方案解密 dump */
+    private static void dumpAndDecrypt(String source, byte[] data) {
+        try {
+            AssetDecrypter.DumpResult dr = AssetDecrypter.tryDecrypt(source, data, capturedKeys);
+            for (String l : dr.logs) dbg("[解密] " + l);
+            AssetDecrypter.DecryptResult best = dr.best();
+            if (best != null && best.success() && best.data != data) {
+                String safe = generateSafeFilename(source);
+                String op = OUTPUT_DIR + "decrypted/" + safe + "_" + best.method + ".html";
+                synchronized (CAPTURED_FILES) {
+                    if (CAPTURED_FILES.add(op)) {
+                        saveFile(op, best.data);
+                        decryptedCount.incrementAndGet();
+                        ok("解密成功[" + best.method + "]: " + source + " → " + best.data.length + "B");
+                        addCapturedFileName("decrypted/" + best.method);
+                    }
+                }
+            }
+        } catch (Exception e) { dbg("解密dump异常: " + e.getMessage()); }
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // Hook：系统 WebView
+    // ════════════════════════════════════════════════════════════════
 
     private static void hookSystemWebView(ClassLoader cl) {
         try {
@@ -329,7 +396,6 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
 
                 for (Method m : x5Class.getDeclaredMethods()) {
                     String name = m.getName();
-                    Class<?>[] pts = m.getParameterTypes();
                     if ((name.equals("loadUrl") || name.equals("loadData") || name.equals("loadDataWithBaseURL")) && !java.lang.reflect.Modifier.isStatic(m.getModifiers())) {
                         try {
                             XposedBridge.hookMethod(m, new XC_MethodHook() {
@@ -337,11 +403,8 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                                 protected void beforeHookedMethod(MethodHookParam param) throws Throwable {
                                     StringBuilder sb = new StringBuilder();
                                     sb.append("X5.").append(param.method.getName()).append(": ");
-                                    for (Object arg : param.args) {
-                                        if (arg instanceof String) sb.append(arg).append(" ");
-                                    }
+                                    for (Object arg : param.args) { if (arg instanceof String) sb.append(arg).append(" "); }
                                     trace(sb.toString());
-
                                     for (Object arg : param.args) {
                                         if (arg instanceof String && ((String) arg).length() > 50) {
                                             String data = (String) arg;
@@ -353,7 +416,6 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                                             }
                                         }
                                     }
-
                                     trackWebView(param.thisObject, "x5");
                                 }
                             });
@@ -405,6 +467,7 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                                 if (data != null && data.length > 0) {
                                     String sn = generateSafeFilename(url); String op = OUTPUT_DIR + "intercepted/" + sn;
                                     saveFile(op, data); ok("拦截捕获: " + url + " (" + data.length + "B)"); addCapturedFileName("intercepted/" + sn);
+                                    dumpAndDecrypt("intercepted/" + sn, data);
                                     p.setResult(new WebResourceResponse(resp.getMimeType(), resp.getEncoding(), new ByteArrayInputStream(data)));
                                 }
                             }
@@ -444,10 +507,20 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             info("✅ Cipher Hook 完成");
         } catch (Exception e) { warn("Cipher Hook 失败: " + e.getMessage()); }
 
+        // 捕获密钥，供 AssetDecrypter 复用
         try { XposedHelpers.findAndHookConstructor("javax.crypto.spec.SecretKeySpec", cl, byte[].class, String.class,
             new XC_MethodHook() { @Override protected void afterHookedMethod(MethodHookParam p) {
-                byte[] key = (byte[]) p.args[0]; String algo = (String) p.args[1];
-                info("🔑 密钥: algorithm=" + algo + " keyLen=" + key.length); dbg("  密钥(hex): " + bytesToHex(key));
+                try {
+                    byte[] key = (byte[]) p.args[0]; String algo = (String) p.args[1];
+                    info("🔑 捕获密钥: algorithm=" + algo + " keyLen=" + key.length);
+                    dbg("  密钥(hex): " + bytesToHex(key));
+                    synchronized (capturedKeys) {
+                        capturedKeys.computeIfAbsent(algo, k -> new ArrayList<>()).add(key.clone());
+                    }
+                    // 保存密钥到文件供人工分析
+                    String op = OUTPUT_DIR + "keys/key_" + algo + "_" + System.currentTimeMillis() + ".bin";
+                    saveFile(op, key);
+                } catch (Exception e) { dbg("密钥捕获异常: " + e.getMessage()); }
             }}); } catch (Exception e) {}
 
         try { XposedHelpers.findAndHookMethod("android.util.Base64", cl, "decode", byte[].class, int.class,
@@ -496,6 +569,10 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         info("✅ Chromium 内核扫描完成");
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // WebView 追踪与 JS 注入
+    // ════════════════════════════════════════════════════════════════
+
     private static void trackWebView(Object webView, String type) {
         synchronized (trackedWebViews) {
             if (!trackedWebViews.contains(webView)) {
@@ -505,6 +582,9 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                 injectBridgeIntoWebView(webView, type);
             }
         }
+        // 自动注入用户自定义JS（在主线程延迟执行，确保页面就绪）
+        Context ctx = appContextRef != null ? appContextRef.get() : null;
+        if (ctx != null) injectCustomJs(webView, type, ctx);
     }
 
     private static void injectBridgeIntoWebView(Object webView, String type) {
@@ -567,8 +647,7 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             if ("system".equals(type) && webView instanceof WebView) {
                 ((WebView) webView).evaluateJavascript(HTML_CAPTURE_JS, (android.webkit.ValueCallback<String>) html -> {
                     if (html != null && !html.isEmpty()) {
-                        String u = html; if (u.startsWith("\"") && u.endsWith("\"")) u = u.substring(1, u.length()-1);
-                        u = u.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
+                        String u = unescapeJsString(html);
                         String op = OUTPUT_DIR + "captured/live_" + System.currentTimeMillis() + ".html";
                         saveFile(op, u.getBytes()); ok("实时HTML捕捉: " + u.length() + " chars"); addCapturedFileName("captured/live");
                     }
@@ -577,14 +656,19 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                 Method evalJs = webView.getClass().getMethod("evaluateJavascript", String.class, android.webkit.ValueCallback.class);
                 evalJs.invoke(webView, HTML_CAPTURE_JS, (android.webkit.ValueCallback<String>) html -> {
                     if (html != null && !html.isEmpty()) {
-                        String u = html; if (u.startsWith("\"") && u.endsWith("\"")) u = u.substring(1, u.length()-1);
-                        u = u.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
+                        String u = unescapeJsString(html);
                         String op = OUTPUT_DIR + "captured/live_" + System.currentTimeMillis() + ".html";
                         saveFile(op, u.getBytes()); ok("X5 HTML捕捉: " + u.length() + " chars"); addCapturedFileName("captured/live");
                     }
                 });
             }
         } catch (Exception e) { warn("HTML捕捉失败: " + e.getMessage()); }
+    }
+
+    private static String unescapeJsString(String html) {
+        String u = html;
+        if (u.startsWith("\"") && u.endsWith("\"")) u = u.substring(1, u.length()-1);
+        return u.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"");
     }
 
     private static void runOptimizationAnalysis(Object webView, String type) {
@@ -635,26 +719,128 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         });
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // 稳定注入：Application + Activity 多重注入点
+    // ════════════════════════════════════════════════════════════════
+
+    private static void hookApplication(ClassLoader cl) {
+        try {
+            XposedHelpers.findAndHookMethod("android.app.Application", cl, "attach", Context.class,
+                new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
+                        Context ctx = (Context) p.args[0];
+                        appContextRef = new WeakReference<>(ctx);
+                        guide("已附加到目标应用进程，准备挂载拦截器");
+                    }
+                });
+            info("✅ Application Hook 完成");
+        } catch (Exception e) { dbg("Application Hook 失败(可能已挂载): " + e.getMessage()); }
+    }
+
     private static void hookActivity(ClassLoader cl) {
         try {
+            // 注入点1：onResume
             XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onResume", new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
                     Activity a = (Activity) p.thisObject; String an = a.getClass().getName(); dbg("Activity.onResume: " + an);
-                    if (shouldTargetActivity(an, a)) {
-                        currentActivityRef = new WeakReference<>(a);
-                        if (!isFloatingShown) { info("🎯 目标Activity: " + an);
-                            new Handler(Looper.getMainLooper()).postDelayed(() -> { Activity c = currentActivityRef.get(); if (c != null && !c.isFinishing()) { showFloatingWindow(c); scanAndDecrypt(c); } }, 1500);
-                        }
-                    }
+                    tryEnsureFloating(a, an, "onResume");
                 }
             });
+            // 注入点2：onWindowFocusChanged（窗口获得焦点时再保一次）
+            try {
+                XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onWindowFocusChanged", boolean.class,
+                    new XC_MethodHook() {
+                        @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
+                            if (!(boolean) p.args[0]) return;
+                            Activity a = (Activity) p.thisObject; String an = a.getClass().getName();
+                            tryEnsureFloating(a, an, "onWindowFocusChanged");
+                        }
+                    });
+            } catch (Exception e) { dbg("onWindowFocusChanged Hook 失败: " + e.getMessage()); }
+            // 注入点3：onAttachedToWindow
+            try {
+                XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onAttachedToWindow", new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) throws Throwable {
+                        Activity a = (Activity) p.thisObject; String an = a.getClass().getName();
+                        tryEnsureFloating(a, an, "onAttachedToWindow");
+                    }
+                });
+            } catch (Exception e) { dbg("onAttachedToWindow Hook 失败: " + e.getMessage()); }
+
             XposedHelpers.findAndHookMethod("android.app.Activity", cl, "onDestroy", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     Activity a = (Activity) p.thisObject; if (currentActivityRef != null && currentActivityRef.get() == a) removeFloatingWindow();
                 }
             });
-            info("✅ Activity生命周期 Hook 完成");
+            info("✅ Activity生命周期 Hook 完成（多重注入点）");
+            guide("已设置3个悬浮窗注入时机(onResume/获焦/附加窗口)，确保悬浮窗稳定出现");
         } catch (Exception e) { warn("Activity Hook 失败: " + e.getMessage()); }
+    }
+
+    /** 统一的悬浮窗保障逻辑：多重注入点 + 重试 + 权限引导 */
+    private static void tryEnsureFloating(Activity a, String an, String hookPoint) {
+        try {
+            if (!shouldTargetActivity(an, a)) return;
+            currentActivityRef = new WeakReference<>(a);
+            if (isFloatingShown && floatingBallView != null && floatingBallView.isShown()) return;
+            // 已显示但视图丢失，先清理
+            if (isFloatingShown) removeFloatingWindow();
+            info("🎯 目标Activity[" + hookPoint + "]: " + an);
+            // 权限检查
+            if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(a)) {
+                warn("缺少悬浮窗权限(SYSTEM_ALERT_WINDOW)，无法显示悬浮窗");
+                guide("请在系统设置中授予「显示在其他应用上层」权限，否则悬浮窗无法出现");
+                showPermissionDialog(a);
+                return;
+            }
+            // 主线程延迟注入
+            new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                Activity c = currentActivityRef.get();
+                if (c == null || c.isFinishing()) return;
+                showFloatingWindowWithRetry(c, 0);
+            }, 800);
+        } catch (Exception e) { warn("悬浮窗保障异常[" + hookPoint + "]: " + e.getMessage()); }
+    }
+
+    /** 带重试的悬浮窗注入 */
+    private static void showFloatingWindowWithRetry(Activity activity, int retry) {
+        try {
+            if (isFloatingShown && floatingBallView != null && floatingBallView.isShown()) return;
+            showFloatingWindow(activity);
+            injectRetryCount = 0;
+            if (!scanStarted) { scanStarted = true; scanAndDecrypt(activity); }
+        } catch (Exception e) {
+            warn("悬浮窗注入失败(第" + (retry+1) + "次): " + e.getMessage());
+            if (retry < MAX_INJECT_RETRY) {
+                new Handler(Looper.getMainLooper()).postDelayed(() -> {
+                    Activity c = currentActivityRef.get();
+                    if (c != null && !c.isFinishing()) showFloatingWindowWithRetry(c, retry + 1);
+                }, 1000);
+            } else {
+                err("悬浮窗注入重试已达上限，改用对话框兜底");
+                showFallbackDialog(activity);
+            }
+        }
+    }
+
+    private static void showPermissionDialog(Activity a) {
+        new Handler(Looper.getMainLooper()).post(() -> {
+            try {
+                new AlertDialog.Builder(a)
+                    .setTitle("🔓 WebDecrypt 需要悬浮窗权限")
+                    .setMessage("为了在目标应用中显示监控悬浮窗，需要授予「显示在其他应用上层」权限。\n\n点击「去授权」跳转到系统设置，授权后重新打开目标应用即可。")
+                    .setPositiveButton("去授权", (d, w) -> {
+                        try {
+                            Intent intent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:" + a.getPackageName()));
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                            a.startActivity(intent);
+                        } catch (Exception ex) { toast(a, "无法打开设置，请手动前往"); }
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+            } catch (Exception e) {}
+        });
     }
 
     private static void removeFloatingWindow() {
@@ -663,76 +849,176 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     }
 
     private static void showFloatingWindow(Activity activity) {
-        try {
-            windowManager = (WindowManager) activity.getSystemService(Context.WINDOW_SERVICE);
-            mainHandler = new Handler(Looper.getMainLooper());
-            final View ballView = createFloatingBall(activity);
-            floatingPanelView = createFloatingPanel(activity);
-            final WindowManager.LayoutParams bp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
-                    Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
-            bp.gravity = Gravity.TOP | Gravity.END; bp.x = 10; bp.y = 200;
-            ballView.setOnTouchListener(new View.OnTouchListener() {
-                private int lx,ly,ix,iy; private long tt; private float sx,sy;
-                public boolean onTouch(View v, MotionEvent e) {
-                    switch(e.getAction()) {
-                        case MotionEvent.ACTION_DOWN: lx=(int)e.getRawX(); ly=(int)e.getRawY(); ix=bp.x; iy=bp.y; tt=System.currentTimeMillis(); sx=e.getRawX(); sy=e.getRawY(); return true;
-                        case MotionEvent.ACTION_MOVE: bp.x=ix-((int)e.getRawX()-lx); bp.y=iy+((int)e.getRawY()-ly); try{windowManager.updateViewLayout(ballView,bp);}catch(Exception x){} return true;
-                        case MotionEvent.ACTION_UP: if(System.currentTimeMillis()-tt<200&&Math.abs(e.getRawX()-sx)+Math.abs(e.getRawY()-sy)<20) togglePanel(activity); return true;
-                    } return false;
+        windowManager = (WindowManager) activity.getSystemService(Context.WINDOW_SERVICE);
+        mainHandler = new Handler(Looper.getMainLooper());
+        final View ballView = createFloatingBall(activity);
+        floatingPanelView = createFloatingPanel(activity);
+        final WindowManager.LayoutParams bp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
+        bp.gravity = Gravity.TOP | Gravity.END; bp.x = 10; bp.y = 200;
+        ballView.setOnTouchListener(new View.OnTouchListener() {
+            private int lx,ly,ix,iy; private long tt; private float sx,sy;
+            public boolean onTouch(View v, MotionEvent e) {
+                switch(e.getAction()) {
+                    case MotionEvent.ACTION_DOWN: lx=(int)e.getRawX(); ly=(int)e.getRawY(); ix=bp.x; iy=bp.y; tt=System.currentTimeMillis(); sx=e.getRawX(); sy=e.getRawY(); return true;
+                    case MotionEvent.ACTION_MOVE: bp.x=ix-((int)e.getRawX()-lx); bp.y=iy+((int)e.getRawY()-ly); try{windowManager.updateViewLayout(ballView,bp);}catch(Exception x){} return true;
+                    case MotionEvent.ACTION_UP: if(System.currentTimeMillis()-tt<200&&Math.abs(e.getRawX()-sx)+Math.abs(e.getRawY()-sy)<20) togglePanel(activity); return true;
                 }
-            });
-            windowManager.addView(ballView, bp); floatingBallView = ballView; isFloatingShown = true;
-            info("✅ 悬浮窗已注入!");
-            mainHandler.postDelayed(new Runnable() { public void run() { updateStats(); if(isFloatingShown) mainHandler.postDelayed(this,2000); } }, 2000);
-        } catch (Exception e) { warn("悬浮窗失败: " + e.getMessage()); showFallbackDialog(activity); }
+                return false;
+            }
+        });
+        windowManager.addView(ballView, bp); floatingBallView = ballView; isFloatingShown = true;
+        info("✅ 悬浮窗已注入!");
+        guide("悬浮窗已出现！点击右上角小球展开面板，可查看实时日志、捕捉HTML、注入JS");
+        mainHandler.postDelayed(new Runnable() { public void run() { updateStats(); if(isFloatingShown) mainHandler.postDelayed(this,2000); } }, 2000);
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // 精美悬浮窗 UI（GradientDrawable 圆角渐变，纯系统 View）
+    // ════════════════════════════════════════════════════════════════
+
+    private static final String COLOR_BG = "#16162E";
+    private static final String COLOR_PANEL = "#1A1A35";
+    private static final String COLOR_CARD = "#20204A";
+    private static final String COLOR_ACCENT = "#E94560";
+    private static final String COLOR_ACCENT2 = "#7B2FF7";
+    private static final String COLOR_TEXT = "#E8E8F0";
+    private static final String COLOR_TEXT_DIM = "#9090B0";
+    private static final String COLOR_OK = "#5BD8A0";
+
+    private static GradientDrawable roundedBg(String color, float radius) {
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(dp(activity(), radius));
+        d.setColor(Color.parseColor(color));
+        return d;
+    }
+
+    private static GradientDrawable gradientBg(int c1, int c2, float radius) {
+        GradientDrawable d = new GradientDrawable(
+            GradientDrawable.Orientation.TL_BR, new int[]{c1, c2});
+        d.setCornerRadius(dp(activity(), radius));
+        return d;
+    }
+
+    private static int dp(Context ctx, float v) {
+        if (ctx == null) return (int) v;
+        return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, ctx.getResources().getDisplayMetrics());
+    }
+
+    private static Activity activity() {
+        return currentActivityRef != null ? currentActivityRef.get() : null;
     }
 
     private static View createFloatingBall(Context ctx) {
-        TextView ball = new TextView(ctx); ball.setText("🔓"); ball.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        ball.setBackgroundColor(Color.parseColor("#1A1A2E")); ball.setPadding(10,10,10,10);
-        LinearLayout w = new LinearLayout(ctx); w.setBackgroundColor(Color.parseColor("#E94560")); w.setPadding(3,3,3,3); w.addView(ball); return w;
+        TextView ball = new TextView(ctx); ball.setText("🔓"); ball.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        ball.setGravity(Gravity.CENTER);
+        ball.setBackground(roundedBg(COLOR_PANEL, 18));
+        ball.setPadding(dp(ctx,10), dp(ctx,8), dp(ctx,10), dp(ctx,8));
+        LinearLayout w = new LinearLayout(ctx);
+        w.setBackground(gradientBg(Color.parseColor(COLOR_ACCENT), Color.parseColor(COLOR_ACCENT2), 20));
+        w.setPadding(dp(ctx,2), dp(ctx,2), dp(ctx,2), dp(ctx,2));
+        w.addView(ball);
+        return w;
     }
 
     private static View createFloatingPanel(Context ctx) {
-        ScrollView sv = new ScrollView(ctx); sv.setBackgroundColor(Color.parseColor("#E01A1A2E"));
-        LinearLayout p = new LinearLayout(ctx); p.setOrientation(LinearLayout.VERTICAL); p.setPadding(16,16,16,16); p.setMinimumWidth(440);
+        ScrollView sv = new ScrollView(ctx);
+        sv.setBackground(roundedBg(COLOR_BG, 20));
+        LinearLayout p = new LinearLayout(ctx); p.setOrientation(LinearLayout.VERTICAL);
+        p.setPadding(dp(ctx,14), dp(ctx,14), dp(ctx,14), dp(ctx,14)); p.setMinimumWidth(dp(ctx,300));
 
-        TextView t = new TextView(ctx); t.setText("🔓 WebDecrypt Pro v9.0"); t.setTextColor(Color.parseColor("#E94560")); t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15); t.setTypeface(null, Typeface.BOLD); t.setPadding(0,0,0,8); p.addView(t);
-        statsTextView = new TextView(ctx); statsTextView.setText("捕获:0|解密:0|失败:0"); statsTextView.setTextColor(Color.WHITE); statsTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11); statsTextView.setPadding(0,0,0,8); p.addView(statsTextView);
+        // 标题栏（渐变）
+        LinearLayout header = new LinearLayout(ctx); header.setOrientation(LinearLayout.VERTICAL);
+        header.setBackground(gradientBg(Color.parseColor(COLOR_ACCENT), Color.parseColor(COLOR_ACCENT2), 14));
+        header.setPadding(dp(ctx,14), dp(ctx,10), dp(ctx,14), dp(ctx,10));
+        TextView t = new TextView(ctx); t.setText("🔓 WebDecrypt Pro v9.1"); t.setTextColor(Color.WHITE);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15); t.setTypeface(null, Typeface.BOLD);
+        header.addView(t);
+        statsTextView = new TextView(ctx); statsTextView.setText("捕获:0 | 解密:0 | 失败:0");
+        statsTextView.setTextColor(Color.parseColor("#FFE0E0")); statsTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        statsTextView.setPadding(0, dp(ctx,4), 0, 0); header.addView(statsTextView);
+        p.addView(header);
 
-        LinearLayout r1 = new LinearLayout(ctx); r1.setOrientation(LinearLayout.HORIZONTAL); r1.setPadding(0,0,0,4);
-        r1.addView(mkBtn(ctx,"▶ 监控","#0F3460", v->{autoCapture.set(true);toast(ctx,"监控已开启");}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r1.addView(mkBtn(ctx,"⏸ 暂停","#16213E", v->{autoCapture.set(false);toast(ctx,"监控已暂停");}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r1.addView(mkBtn(ctx,"📁 导出","#E94560", v->{flushLog();toast(ctx,"日志已保存");}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
+        // 操作按钮区
+        LinearLayout r1 = mkRow(ctx);
+        r1.addView(mkBtn(ctx,"▶ 盰控", COLOR_CARD, v->{autoCapture.set(true);toast(ctx,"监控已开启");}), w1());
+        r1.addView(mkBtn(ctx,"⏸ 暂停","#16213E", v->{autoCapture.set(false);toast(ctx,"监控已暂停");}), w1());
+        r1.addView(mkBtn(ctx,"📁 导出", COLOR_ACCENT, v->{flushLog();toast(ctx,"日志已保存到 "+OUTPUT_DIR);}), w1());
         p.addView(r1);
 
-        LinearLayout r2 = new LinearLayout(ctx); r2.setOrientation(LinearLayout.HORIZONTAL); r2.setPadding(0,0,0,4);
-        r2.addView(mkBtn(ctx,"🌐 捕捉HTML","#0F3460", v->{forEachWv((wv,t2)->captureCurrentHtml(wv,t2));toast(ctx,"HTML捕捉已触发");}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r2.addView(mkBtn(ctx,"🧠 优化分析","#0F3460", v->{forEachWv((wv,t2)->runOptimizationAnalysis(wv,t2));toast(ctx,"优化分析已触发");}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r2.addView(mkBtn(ctx,"💉 注入JS","#0F3460", v->showJsInjectDialog(ctx)), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
+        LinearLayout r2 = mkRow(ctx);
+        r2.addView(mkBtn(ctx,"🌐 捕HTML", COLOR_CARD, v->{forEachWv((wv,t2)->captureCurrentHtml(wv,t2));toast(ctx,"HTML捕捉已触发");}), w1());
+        r2.addView(mkBtn(ctx,"🧠 优化", COLOR_CARD, v->{forEachWv((wv,t2)->runOptimizationAnalysis(wv,t2));toast(ctx,"优化分析已触发");}), w1());
+        r2.addView(mkBtn(ctx,"💉 注JS", COLOR_CARD, v->showJsInjectDialog(ctx)), w1());
         p.addView(r2);
 
-        LinearLayout r3 = new LinearLayout(ctx); r3.setOrientation(LinearLayout.HORIZONTAL); r3.setPadding(0,0,0,4);
-        r3.addView(mkBtn(ctx,"📜 内置脚本","#0F3460", v->showBuiltInScriptsDialog(ctx)), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r3.addView(mkBtn(ctx,"🔧 网页调试","#0F3460", v->showWebDebugDialog(ctx)), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
-        r3.addView(mkBtn(ctx,"📋 源码","#16213E", v->{forEachWv((wv,t2)->{if("system".equals(t2)&&wv instanceof WebView)((WebView)wv).evaluateJavascript(HTML_CAPTURE_JS,(android.webkit.ValueCallback<String>)h->{if(h!=null){String u=h;if(u.startsWith("\"")&&u.endsWith("\""))u=u.substring(1,u.length()-1);u=u.replace("\\n","\n").replace("\\\"","\"");String op=OUTPUT_DIR+"captured/src_"+System.currentTimeMillis()+".html";saveFile(op,u.getBytes());ok("源码捕捉:"+u.length());addCapturedFileName("captured/src");}});});}), new LinearLayout.LayoutParams(0,LinearLayout.LayoutParams.WRAP_CONTENT,1f));
+        LinearLayout r3 = mkRow(ctx);
+        r3.addView(mkBtn(ctx,"📜 脚本", COLOR_CARD, v->showBuiltInScriptsDialog(ctx)), w1());
+        r3.addView(mkBtn(ctx,"🔧 调试", COLOR_CARD, v->showWebDebugDialog(ctx)), w1());
+        r3.addView(mkBtn(ctx,"📋 源码","#16213E", v->{forEachWv((wv,t2)->{if("system".equals(t2)&&wv instanceof WebView)((WebView)wv).evaluateJavascript(HTML_CAPTURE_JS,(android.webkit.ValueCallback<String>)h->{if(h!=null){String u=unescapeJsString(h);String op=OUTPUT_DIR+"captured/src_"+System.currentTimeMillis()+".html";saveFile(op,u.getBytes());ok("源码捕捉:"+u.length());addCapturedFileName("captured/src");}});});}), w1());
         p.addView(r3);
 
-        TextView ot = new TextView(ctx); ot.setText("🧠 优化建议"); ot.setTextColor(Color.parseColor("#E94560")); ot.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); ot.setTypeface(null, Typeface.BOLD); ot.setPadding(0,8,0,4); p.addView(ot);
-        optimizationTextView = new TextView(ctx); optimizationTextView.setText("点击「🧠 优化分析」获取建议..."); optimizationTextView.setTextColor(Color.parseColor("#AADDAA")); optimizationTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10); optimizationTextView.setMaxLines(12); optimizationTextView.setPadding(8,8,8,8); optimizationTextView.setBackgroundColor(Color.parseColor("#0A0A1A")); p.addView(optimizationTextView);
+        // 实时日志面板（新手友好）
+        p.addView(mkSectionTitle(ctx, "📋 实时日志"));
+        liveLogTextView = new TextView(ctx); liveLogTextView.setText("等待日志...");
+        liveLogTextView.setTextColor(Color.parseColor(COLOR_OK)); liveLogTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        liveLogTextView.setTypeface(Typeface.MONOSPACE); liveLogTextView.setMaxLines(8);
+        liveLogTextView.setPadding(dp(ctx,8), dp(ctx,8), dp(ctx,8), dp(ctx,8));
+        liveLogTextView.setBackground(roundedBg("#0A0A1A", 10));
+        p.addView(liveLogTextView);
+        LinearLayout logRow = mkRow(ctx);
+        logRow.addView(mkBtn(ctx,"📄 完整日志", COLOR_CARD, v->showFullLogDialog(ctx)), w1());
+        logRow.addView(mkBtn(ctx,"🧹 清空日志", "#16213E", v->{synchronized(LIVE_LOG){LIVE_LOG.clear();}updateLiveLogView();toast(ctx,"实时日志已清空");}), w1());
+        p.addView(logRow);
 
-        TextView ft = new TextView(ctx); ft.setText("📁 已捕获文件"); ft.setTextColor(Color.parseColor("#E94560")); ft.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); ft.setTypeface(null, Typeface.BOLD); ft.setPadding(0,8,0,4); p.addView(ft);
-        fileListTextView = new TextView(ctx); fileListTextView.setText("等待捕获..."); fileListTextView.setTextColor(Color.parseColor("#A7A7A7")); fileListTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9); fileListTextView.setMaxLines(6); p.addView(fileListTextView);
+        // 优化建议
+        p.addView(mkSectionTitle(ctx, "🧠 优化建议"));
+        optimizationTextView = new TextView(ctx); optimizationTextView.setText("点击「🧠 优化」获取建议...");
+        optimizationTextView.setTextColor(Color.parseColor(COLOR_OK)); optimizationTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+        optimizationTextView.setMaxLines(12); optimizationTextView.setPadding(dp(ctx,8), dp(ctx,8), dp(ctx,8), dp(ctx,8));
+        optimizationTextView.setBackground(roundedBg("#0A0A1A", 10));
+        p.addView(optimizationTextView);
 
-        Button cb = new Button(ctx); cb.setText("✕ 收起"); cb.setBackgroundColor(Color.TRANSPARENT); cb.setTextColor(Color.parseColor("#E94560")); cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11); cb.setOnClickListener(v2->togglePanel(ctx)); p.addView(cb);
+        // 已捕获文件
+        p.addView(mkSectionTitle(ctx, "📁 已捕获文件"));
+        fileListTextView = new TextView(ctx); fileListTextView.setText("等待捕获...");
+        fileListTextView.setTextColor(Color.parseColor(COLOR_TEXT_DIM)); fileListTextView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 9);
+        fileListTextView.setMaxLines(6); fileListTextView.setPadding(dp(ctx,8), dp(ctx,4), dp(ctx,8), dp(ctx,4));
+        fileListTextView.setBackground(roundedBg("#0A0A1A", 10));
+        p.addView(fileListTextView);
+
+        Button cb = new Button(ctx); cb.setText("✕ 收起"); cb.setBackgroundColor(Color.TRANSPARENT);
+        cb.setTextColor(Color.parseColor(COLOR_ACCENT)); cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        cb.setOnClickListener(v2->togglePanel(ctx)); p.addView(cb);
 
         sv.addView(p); return sv;
     }
 
+    private static LinearLayout mkRow(Context ctx) {
+        LinearLayout r = new LinearLayout(ctx); r.setOrientation(LinearLayout.HORIZONTAL);
+        r.setPadding(0, dp(ctx,3), 0, dp(ctx,3)); return r;
+    }
+
+    private static LinearLayout.LayoutParams w1() {
+        return new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+    }
+
+    private static TextView mkSectionTitle(Context ctx, String text) {
+        TextView tv = new TextView(ctx); tv.setText(text); tv.setTextColor(Color.parseColor(COLOR_ACCENT));
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); tv.setTypeface(null, Typeface.BOLD);
+        tv.setPadding(0, dp(ctx,8), 0, dp(ctx,4)); return tv;
+    }
+
     private static Button mkBtn(Context ctx, String text, String bg, View.OnClickListener l) {
-        Button b = new Button(ctx); b.setText(text); b.setBackgroundColor(Color.parseColor(bg)); b.setTextColor(Color.WHITE); b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11); b.setPadding(8,4,8,4); b.setMinHeight(0); b.setMinimumHeight(0); b.setOnClickListener(l);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT); lp.setMargins(2,0,2,0); b.setLayoutParams(lp); return b;
+        Button b = new Button(ctx); b.setText(text); b.setTextColor(Color.WHITE);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11); b.setPadding(dp(ctx,6), dp(ctx,4), dp(ctx,6), dp(ctx,4));
+        b.setMinHeight(0); b.setMinimumHeight(0); b.setAllCaps(false);
+        b.setBackground(roundedBg(bg, 10));
+        b.setOnClickListener(l);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(dp(ctx,2),0,dp(ctx,2),0); b.setLayoutParams(lp); return b;
     }
 
     private static void toast(Context ctx, String msg) { Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show(); }
@@ -745,14 +1031,22 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         }
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // 对话框
+    // ════════════════════════════════════════════════════════════════
+
     private static void showJsInjectDialog(Context ctx) {
         try {
             Activity a = currentActivityRef != null ? currentActivityRef.get() : null;
             if (a == null || a.isFinishing()) { toast(ctx, "无法打开"); return; }
             AlertDialog.Builder b = new AlertDialog.Builder(a); b.setTitle("💉 JS注入");
-            LinearLayout dl = new LinearLayout(a); dl.setOrientation(LinearLayout.VERTICAL); dl.setPadding(32,16,32,16);
-            TextView h = new TextView(a); h.setText("输入JavaScript代码:"); h.setTextColor(Color.parseColor("#8888AA")); h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); h.setPadding(0,0,0,8); dl.addView(h);
-            EditText ji = new EditText(a); ji.setHint("// JS代码..."); ji.setHintTextColor(Color.parseColor("#555577")); ji.setTextColor(Color.parseColor("#AADDAA")); ji.setBackgroundColor(Color.parseColor("#1A1A2E")); ji.setTypeface(Typeface.MONOSPACE); ji.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); ji.setPadding(16,12,16,12); ji.setMinLines(5); ji.setGravity(Gravity.TOP|Gravity.START);
+            LinearLayout dl = new LinearLayout(a); dl.setOrientation(LinearLayout.VERTICAL); dl.setPadding(dp(a,24), dp(a,12), dp(a,24), dp(a,12));
+            TextView h = new TextView(a); h.setText("输入JavaScript代码:"); h.setTextColor(Color.parseColor(COLOR_TEXT_DIM));
+            h.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); h.setPadding(0,0,0,dp(a,8)); dl.addView(h);
+            EditText ji = new EditText(a); ji.setHint("// JS代码..."); ji.setHintTextColor(Color.parseColor("#555577"));
+            ji.setTextColor(Color.parseColor(COLOR_OK)); ji.setBackground(roundedBg(COLOR_PANEL, 8));
+            ji.setTypeface(Typeface.MONOSPACE); ji.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            ji.setPadding(dp(a,12), dp(a,10), dp(a,12), dp(a,10)); ji.setMinLines(5); ji.setGravity(Gravity.TOP|Gravity.START);
             SharedPreferences sp = getModulePrefs(ctx); if (sp != null) { String sv = sp.getString(KEY_JS_SCRIPTS,""); if (sv != null && !sv.isEmpty()) { String[] pts = sv.split("#---#"); if (pts.length > 0 && !pts[0].trim().isEmpty()) ji.setText(pts[0].trim()); } }
             dl.addView(ji); b.setView(dl);
             b.setPositiveButton("注入", (d,w) -> { String js = ji.getText().toString().trim(); if(js.isEmpty()) return; forEachWv((wv,t2)->runBuiltInScript(wv,t2,js)); toast(ctx,"JS已注入!"); });
@@ -765,13 +1059,15 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
             Activity a = currentActivityRef != null ? currentActivityRef.get() : null;
             if (a == null || a.isFinishing()) return;
             AlertDialog.Builder b = new AlertDialog.Builder(a); b.setTitle("📜 内置脚本");
-            LinearLayout dl = new LinearLayout(a); dl.setOrientation(LinearLayout.VERTICAL); dl.setPadding(24,16,24,16);
+            LinearLayout dl = new LinearLayout(a); dl.setOrientation(LinearLayout.VERTICAL); dl.setPadding(dp(a,18), dp(a,12), dp(a,18), dp(a,12));
 
             java.util.Map<String, List<BuiltInScripts.ScriptItem>> cats = BuiltInScripts.getScriptsByCategory();
             for (java.util.Map.Entry<String, List<BuiltInScripts.ScriptItem>> entry : cats.entrySet()) {
-                TextView catTitle = new TextView(a); catTitle.setText(entry.getKey()); catTitle.setTextColor(Color.parseColor("#E94560")); catTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14); catTitle.setTypeface(null, Typeface.BOLD); catTitle.setPadding(0,12,0,4); dl.addView(catTitle);
+                TextView catTitle = new TextView(a); catTitle.setText(entry.getKey()); catTitle.setTextColor(Color.parseColor(COLOR_ACCENT));
+                catTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14); catTitle.setTypeface(null, Typeface.BOLD);
+                catTitle.setPadding(0,dp(a,10),0,dp(a,4)); dl.addView(catTitle);
                 for (BuiltInScripts.ScriptItem si : entry.getValue()) {
-                    Button btn = new Button(a); btn.setText(si.name); btn.setBackgroundColor(Color.parseColor("#0F3460")); btn.setTextColor(Color.WHITE); btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12); btn.setAllCaps(false); btn.setPadding(12,4,12,4); btn.setMinHeight(0); btn.setMinimumHeight(0);
+                    Button btn = mkBtn(a, si.name, COLOR_CARD, null);
                     String code = si.code;
                     btn.setOnClickListener(v -> { forEachWv((wv,t2)->runBuiltInScript(wv,t2,code)); toast(ctx, si.name + " 已执行"); });
                     dl.addView(btn);
@@ -806,6 +1102,28 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
         } catch (Exception e) { warn("调试对话框失败: " + e.getMessage()); }
     }
 
+    /** 完整日志查看对话框（新手友好） */
+    private static void showFullLogDialog(Context ctx) {
+        try {
+            Activity a = currentActivityRef != null ? currentActivityRef.get() : null;
+            if (a == null || a.isFinishing()) return;
+            StringBuilder sb = new StringBuilder();
+            synchronized (LIVE_LOG) {
+                for (String line : LIVE_LOG) sb.append(line).append("\n");
+            }
+            if (sb.length() == 0) sb.append("暂无日志，打开目标应用后会产生日志");
+            AlertDialog.Builder builder = new AlertDialog.Builder(a);
+            builder.setTitle("📋 实时日志 (最近" + LIVE_LOG_MAX + "条)");
+            TextView logView = new TextView(a); logView.setText(sb.toString());
+            logView.setTextColor(Color.parseColor(COLOR_OK)); logView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+            logView.setTypeface(Typeface.MONOSPACE); logView.setPadding(dp(a,18), dp(a,12), dp(a,18), dp(a,12));
+            ScrollView scroll = new ScrollView(a); scroll.addView(logView);
+            builder.setView(scroll);
+            builder.setPositiveButton("导出到文件", (d,w) -> { flushLog(); toast(a, "日志已保存到 " + LOG_FILE); });
+            builder.setNegativeButton("关闭", null); builder.show();
+        } catch (Exception e) { warn("日志对话框失败: " + e.getMessage()); }
+    }
+
     private static void togglePanel(Context ctx) {
         try {
             if (isPanelExpanded) { if (floatingPanelView != null && floatingPanelView.isShown()) windowManager.removeView(floatingPanelView); isPanelExpanded = false; }
@@ -816,7 +1134,7 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     }
 
     private static void updateStats() {
-        if (statsTextView != null && mainHandler != null) mainHandler.post(() -> { try { statsTextView.setText("捕获:"+capturedCount.get()+"|解密:"+decryptedCount.get()+"|失败:"+failedCount.get()); } catch (Exception e) {} });
+        if (statsTextView != null && mainHandler != null) mainHandler.post(() -> { try { statsTextView.setText("捕获:"+capturedCount.get()+" | 解密:"+decryptedCount.get()+" | 失败:"+failedCount.get()); } catch (Exception e) {} });
     }
 
     private static void addCapturedFileName(String name) {
@@ -825,15 +1143,20 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     }
 
     private static void showFallbackDialog(Activity a) {
-        new Handler(Looper.getMainLooper()).post(() -> { try { new AlertDialog.Builder(a).setTitle("🔓 WebDecrypt Pro v9.0").setMessage("拦截已激活!\n功能:AssetManager|WebView|Cipher|Chromium|X5|JS注入|HTML捕捉|反检测\n输出:"+OUTPUT_DIR+"\n统计:捕获"+capturedCount.get()+" 解密"+decryptedCount.get()).setPositiveButton("导出日志",(d,w)->{flushLog();toast(a,"日志已保存");}).setNegativeButton("关闭",null).show(); } catch (Exception e) {} });
+        new Handler(Looper.getMainLooper()).post(() -> { try { new AlertDialog.Builder(a).setTitle("🔓 WebDecrypt Pro v9.1").setMessage("拦截已激活!\n功能:AssetManager|WebView|Cipher|Chromium|X5|JS注入|HTML捕捉|反检测|多方案解密\n输出:"+OUTPUT_DIR+"\n统计:捕获"+capturedCount.get()+" 解密"+decryptedCount.get()).setPositiveButton("导出日志",(d,w)->{flushLog();toast(a,"日志已保存");}).setNegativeButton("关闭",null).show(); } catch (Exception e) {} });
     }
 
+    // ════════════════════════════════════════════════════════════════
+    // 全量扫描（更多 dump）
+    // ════════════════════════════════════════════════════════════════
+
     private static void scanAndDecrypt(Activity a) {
-        info("开始全量扫描..."); new Thread(() -> { try {
+        info("开始全量扫描..."); guide("正在扫描APK内全部资源，遇到加密文件会自动尝试多种方式解密");
+        new Thread(() -> { try {
             String apk = a.getApplicationInfo().sourceDir; ZipFile zip = new ZipFile(apk); java.util.Enumeration<? extends ZipEntry> es = zip.entries(); int c = 0;
             while (es.hasMoreElements()) { ZipEntry e = es.nextElement(); String n = e.getName();
                 if (n.contains("assets/") && isTargetFile(n)) { try { InputStream is = zip.getInputStream(e); byte[] d = readInputStream(is);
-                    if (d != null && d.length > 0) { String op = OUTPUT_DIR+"scanned/"+n.substring(n.indexOf("assets/")+7); synchronized(CAPTURED_FILES){if(CAPTURED_FILES.add(op)){saveFile(op,d);ok("扫描捕获: "+n+" ("+d.length+"B)");c++;}} } } catch (Exception x){} }
+                    if (d != null && d.length > 0) { String op = OUTPUT_DIR+"scanned/"+n.substring(n.indexOf("assets/")+7); synchronized(CAPTURED_FILES){if(CAPTURED_FILES.add(op)){saveFile(op,d);ok("扫描捕获: "+n+" ("+d.length+"B)");c++;dumpAndDecrypt("scan/"+n, d);}} } } catch (Exception x){} }
             } zip.close(); info("APK扫描完成: "+c+" 个文件"); scanDataDir(a);
         } catch (Exception e) { err("扫描失败: "+e.getMessage()); } }).start();
     }
@@ -847,8 +1170,12 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
     private static void scanDirRecursive(File dir, String bp) {
         File[] fs = dir.listFiles(); if (fs == null) return;
         for (File f : fs) { if (f.isDirectory()) scanDirRecursive(f, bp); else if (isTargetFile(f.getName()) && f.length() < 50*1024*1024) { try { InputStream is = new java.io.FileInputStream(f); byte[] d = readInputStream(is);
-            if (d != null && isHtmlContent(d)) { String rp = f.getAbsolutePath().substring(bp.length()); String op = OUTPUT_DIR+"scanned/data"+rp; synchronized(CAPTURED_FILES){if(CAPTURED_FILES.add(op)){saveFile(op,d);ok("Data目录捕获: "+rp+" ("+d.length+"B)");}} } } catch (Exception e){} } }
+            if (d != null && (isHtmlContent(d) || AssetDecrypter.looksEncrypted(d))) { String rp = f.getAbsolutePath().substring(bp.length()); String op = OUTPUT_DIR+"scanned/data"+rp; synchronized(CAPTURED_FILES){if(CAPTURED_FILES.add(op)){saveFile(op,d);ok("Data目录捕获: "+rp+" ("+d.length+"B)");dumpAndDecrypt("data"+rp, d);}} } } catch (Exception e){} } }
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // 主入口
+    // ════════════════════════════════════════════════════════════════
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
@@ -858,14 +1185,16 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
                 lpparam.packageName.startsWith("com.topjohnwu.")) return;
 
         info("╔══════════════════════════════════════════════════════════╗");
-        info("║  WebDecrypt Pro v9.0 — 目标: " + lpparam.packageName);
+        info("║  WebDecrypt Pro v9.1 — 目标: " + lpparam.packageName);
         info("╚══════════════════════════════════════════════════════════╝");
+        guide("模块已加载到目标应用，开始安装各层拦截器（共7层）");
 
         ensureDirs();
 
         try { AntiDetectionHook.install(lpparam); } catch (Exception e) { warn("反检测引擎异常: " + e.getMessage()); }
 
         ClassLoader cl = lpparam.classLoader;
+        hookApplication(cl);
         hookAssetManager(cl);
         hookSystemWebView(cl);
         hookX5WebView(cl);
@@ -878,7 +1207,8 @@ public class WebDecryptHook implements IXposedHookLoadPackage {
 
         info("══════════════════════════════════════════════════════════");
         info("  所有Hook已安装! 目标: " + lpparam.packageName);
-        info("  功能: 拦截|X5|JS注入|HTML捕捉|反检测|内置脚本|网页调试");
+        info("  功能: 拦截|X5|JS注入|HTML捕捉|反检测|内置脚本|网页调试|多方案解密");
+        guide("拦截器安装完成。打开目标应用页面后，悬浮窗会自动出现，可在面板查看实时日志");
         info("══════════════════════════════════════════════════════════");
     }
 }

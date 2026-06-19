@@ -1,18 +1,12 @@
-# WebDecrypt Pro v8.0 — 通用Web本地加密HTML解密工具
+# WebDecrypt Pro v9.1 — 通用Web本地加密HTML解密工具（LSP增强版）
 
 ## 项目概述
 
-本项目包含两个版本:
-
-### 1. Frida脚本版 (`web_decrypt_hook_enhanced.js`)
-- 即插即用,无需编译
-- 通过Frida注入到目标App
-- 适合快速分析和调试
-
-### 2. Xposed/LSPosed模块版 (`WebDecryptXposed/`)
-- 持久化Hook,重启后自动生效
-- 通过LSPosed/Xposed框架激活
+本项目为 Xposed/LSPosed 模块版 (`app/`)：
+- 持久化 Hook，重启后自动生效
+- 通过 LSPosed/Xposed 框架激活
 - 适合长期监控和分析
+- v9.1：稳定注入 + 悬浮窗保障 + 精美UI + 新手友好日志 + 多方案解密
 
 ## 核心原理
 
